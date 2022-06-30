@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+    This template creates canary which is capable of monitoring a site with mutual authentication.
+    Certificate and key are stored in secrets manager.
+
+Parameters:
+
+  UrlToMonitor:
+    Type: String
+    Description: "Enter URL without https://."
+
+  CanaryName: 
+    Type: String
+    Description: "Unique name of the new canary probe. It has to be lowercase and respect following regex: ^[0-9a-z_\\-]+$"
+    AllowedPattern: "^[0-9a-z_\\-]+$"
+    
+  CertificatePublicPart:
+    Type: String
+    Description: "Public part of the certificate in PEM format, it will be stored into AWS Secrets Manager"
+
+  CertificatePrivateKey:
+    Type: String
+    Description: "Private key of the client certificate in PEM format, it will be stored into AWS Secrets Manager"
+    NoEcho: True
+
+Resources:
+
+    IAMRoleForCanary:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: "/service-role/"
+            RoleName: !Sub "CloudWatchSyntheticsRole-${AWS::StackName}"
+            AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+            MaxSessionDuration: 3600
+            ManagedPolicyArns: 
+              - !Ref IAMManagedPolicyForCanary
+            Description: "CloudWatch Synthetics lambda execution role for running canaries"
+
+    IAMManagedPolicyForCanary:
+        Type: "AWS::IAM::ManagedPolicy"
+        Properties:
+            ManagedPolicyName: !Sub "CloudWatchSyntheticsPolicy-${AWS::StackName}"
+            Path: "/service-role/"
+            PolicyDocument: !Sub |
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "s3:PutObject",
+                                "s3:GetObject"
+                            ],
+                            "Resource": [
+                                "arn:aws:s3:::${S3BucketCanaryResults}/*"
+                            ]
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "s3:GetBucketLocation"
+                            ],
+                            "Resource": [
+                                "arn:aws:s3:::${S3BucketCanaryResults}"
+                            ]
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "logs:CreateLogStream",
+                                "logs:PutLogEvents",
+                                "logs:CreateLogGroup"
+                            ],
+                            "Resource": [
+                                "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cwsyn-*"
+                            ]
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "s3:ListAllMyBuckets",
+                                "xray:PutTraceSegments"
+                            ],
+                            "Resource": [
+                                "*"
+                            ]
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Resource": "*",
+                            "Action": "cloudwatch:PutMetricData",
+                            "Condition": {
+                                "StringEquals": {
+                                    "cloudwatch:namespace": "CloudWatchSynthetics"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": "secretsmanager:GetSecretValue",
+                            "Resource": [
+                                "${SecretsManagerSecretPublicPart}",
+                                "${SecretsManagerSecretPrivateKey}"
+                                ]
+                        }
+                    ]
+                }
+
+    S3BucketCanaryResults:
+      Type: "AWS::S3::Bucket"      
+
+    SyntheticsCanary:
+        Type: "AWS::Synthetics::Canary"
+        Properties:
+            Name: !Sub "${CanaryName}"
+            Code: 
+                Handler: "apiCanaryBlueprint.handler"
+                Script: |              
+                    // Load the AWS SDK and the Secrets Manager client.
+                    const AWS = require('aws-sdk');
+                    const secretsManager = new AWS.SecretsManager();
+
+                    // Connect to the Secrets Manager the load the Key and Cert
+                    // These are the secrets created previously
+                    // The code is dynamic and load the secrets name via environment vars
+                    const getKeyCert = async () => {
+
+                        const key = await secretsManager.getSecretValue({ SecretId: process.env.privateKey.replace(/\\n/gm, '\n') }).promise();
+                        const cert = await secretsManager.getSecretValue({ SecretId: process.env.publicPart.replace(/\\n/gm, '\n') }).promise();
+                        
+                        // returning Key and Cert
+                        return [ key.SecretString, cert.SecretString ]
+                    }
+
+                    var synthetics = require('Synthetics');
+                    const log = require('SyntheticsLogger');
+                    const syntheticsConfiguration = synthetics.getConfiguration();
+
+                    const apiCanaryBlueprint = async function () {
+
+                        // Add the line below to load the key and cert from the function getKeyCert()
+                        const [ key, cert ] = await getKeyCert();
+
+                        syntheticsConfiguration.setConfig({
+                            restrictedHeaders: [], // Value of these headers will be redacted from logs and reports
+                            restrictedUrlParameters: [] // Values of these url parameters will be redacted from logs and reports
+                        });
+                        
+                        // Handle validation for positive scenario
+                        const validateSuccessful = async function(res) {
+                            return new Promise((resolve, reject) => {
+                                if (res.statusCode < 200 || res.statusCode > 299) {
+                                    throw res.statusCode + ' ' + res.statusMessage;
+                                }
+                        
+                                let responseBody = '';
+                                res.on('data', (d) => {
+                                    responseBody += d;
+                                });
+                        
+                                res.on('end', () => {
+                                    // Add validation on 'responseBody' here if required.
+                                    resolve();
+                                });
+                            });
+                        };
+                                                
+                        let requestOptionsStep1 = {
+                            hostname: process.env.UrlToMonitor,
+                            method: 'GET',
+                            path: '/',
+                            port: '443',
+                            protocol: 'https:',
+                            body: "",
+                            headers: {},
+                            key: key, //clients key from Secrets Manager
+                            cert: cert //clients cert from Secrets Manager
+                        };
+                        requestOptionsStep1['headers']['User-Agent'] = [synthetics.getCanaryUserAgentString(), requestOptionsStep1['headers']['User-Agent']].join(' ');
+
+                      let stepConfig1 = {
+                            includeRequestHeaders: false,
+                            includeResponseHeaders: false,
+                            includeRequestBody: false,
+                            includeResponseBody: false,
+                            continueOnHttpStepFailure: true
+                        };
+
+                        await synthetics.executeHttpStep('Verify ' + process.env.UrlToMonitor, requestOptionsStep1, validateSuccessful, stepConfig1);
+
+                        
+                    };
+
+                    exports.handler = async () => {
+                        return await apiCanaryBlueprint();
+                    };
+            ExecutionRoleArn:
+              Fn::GetAtt:
+                - IAMRoleForCanary
+                - Arn
+            Schedule: 
+                Expression: rate(5 minutes)
+                DurationInSeconds: 0
+            RunConfig: 
+                TimeoutInSeconds: 300
+                MemoryInMB: 1000
+                EnvironmentVariables:
+                    UrlToMonitor : !Sub "${UrlToMonitor}"
+                    publicPart : !Sub "${AWS::StackName}-public-part"
+                    privateKey : !Sub "${AWS::StackName}-private-key"
+            SuccessRetentionPeriod: 31
+            FailureRetentionPeriod: 31
+            ArtifactS3Location:
+                Fn::Join:
+                    - ''
+                    - - s3://
+                      - Ref: S3BucketCanaryResults
+            RuntimeVersion: syn-nodejs-puppeteer-3.6
+            StartCanaryAfterCreation: true
+
+    SecretsManagerSecretPublicPart:
+        Type: "AWS::SecretsManager::Secret"
+        Properties:
+            Name: !Sub "${AWS::StackName}-public-part"
+            SecretString: !Ref CertificatePublicPart
+    
+    SecretsManagerSecretPrivateKey:
+        Type: "AWS::SecretsManager::Secret"
+        Properties:
+            Name: !Sub "${AWS::StackName}-private-key"
+            SecretString: !Ref CertificatePrivateKey
